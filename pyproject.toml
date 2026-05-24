@@ -1,0 +1,12 @@
+[project]
+name = "transfermodel"
+version = "0.1.0"
+description = "本地 LLM API 桌面代理，支持多上游转发，图形化配置"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pyside6>=6.7.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "httpx>=0.28.0",
+]
