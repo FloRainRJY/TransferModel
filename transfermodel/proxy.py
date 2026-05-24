@@ -450,6 +450,18 @@ async def forward_responses_anthropic(
             status_code=502)
 
     if is_stream:
+        ct = upstream_resp.headers.get("content-type", "")
+        if not ct.startswith("text/event-stream"):
+            # Upstream returned non-SSE (likely an error or non-streaming)
+            logger.warning(
+                "Expected SSE but got %s, body: %s",
+                ct, upstream_resp.text[:500],
+            )
+            return JSONResponse(
+                {"error": {"message": upstream_resp.text[:1000]}},
+                status_code=upstream_resp.status_code,
+            )
+
         resp_headers = _filter_headers(upstream_resp.headers)
 
         async def translated_anthropic_stream():
