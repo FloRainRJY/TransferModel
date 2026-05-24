@@ -237,3 +237,137 @@ def chat_response_to_responses(chat_resp: dict, resp_id: str, model: str) -> dic
             "total_tokens": usage.get("total_tokens", 0),
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Responses → Anthropic Messages  (for DeepSeek V4 /anthropic endpoint)
+# ---------------------------------------------------------------------------
+
+def responses_to_anthropic_request(body: dict) -> dict:
+    """Convert a Responses-API request body to Anthropic Messages format."""
+    system_parts = []
+    messages = []
+
+    instructions = body.get("instructions", "")
+    if instructions:
+        system_parts.append(instructions)
+
+    inp = body.get("input", "")
+    if isinstance(inp, str):
+        messages.append({"role": "user", "content": inp})
+    elif isinstance(inp, list):
+        for block in inp:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type", "")
+            role = block.get("role", "user")
+            content = block.get("content", "")
+
+            if isinstance(content, list):
+                text_bits = []
+                for c in content:
+                    ct = c.get("type", "")
+                    if ct in ("input_text", "output_text"):
+                        text_bits.append(c.get("text", ""))
+                messages.append({"role": role, "content": " ".join(text_bits)})
+            elif isinstance(content, str):
+                messages.append({"role": role, "content": content})
+
+    anthropic = {
+        "model": body.get("model", ""),
+        "max_tokens": body.get("max_output_tokens", 4096),
+        "messages": messages,
+        "stream": body.get("stream", False),
+    }
+    if system_parts:
+        anthropic["system"] = "\n".join(system_parts)
+    if "temperature" in body:
+        anthropic["temperature"] = body["temperature"]
+    if "top_p" in body:
+        anthropic["top_p"] = body["top_p"]
+    if "stop" in body:
+        anthropic["stop_sequences"] = body["stop"]
+
+    return anthropic
+
+
+def anthropic_sse_to_responses_sse(
+    event_type: str, data: dict, resp_id: str, model: str
+) -> list[str]:
+    """Convert an Anthropic SSE event to one or more Responses-API SSE strings.
+
+    Returns a list of SSE payload strings (each a sequence of
+    "event: ...\\ndata: ..." lines).
+    """
+    results = []
+
+    if event_type == "message_start":
+        ev = {
+            "id": resp_id,
+            "object": "response",
+            "model": model,
+            "output": [],
+        }
+        results.append(
+            f"event: response.created\ndata: {json.dumps(ev, ensure_ascii=False)}"
+        )
+
+    elif event_type == "content_block_delta":
+        delta = data.get("delta", {})
+        if delta.get("type") == "text_delta":
+            text = delta.get("text", "")
+            if text:
+                ev = {"delta": text}
+                results.append(
+                    f"event: response.output_text.delta\n"
+                    f"data: {json.dumps(ev, ensure_ascii=False)}"
+                )
+
+    elif event_type == "message_stop":
+        ev = {
+            "id": resp_id,
+            "object": "response",
+            "model": model,
+            "status": "completed",
+        }
+        results.append(
+            f"event: response.completed\n"
+            f"data: {json.dumps(ev, ensure_ascii=False)}"
+        )
+
+    return results
+
+
+def anthropic_response_to_responses(
+    anthropic_resp: dict, resp_id: str, model: str
+) -> dict:
+    """Convert an Anthropic Messages non-streaming response to Responses API."""
+    output = []
+    for block in anthropic_resp.get("content", []):
+        if block.get("type") == "text":
+            output.append({
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": block.get("text", ""),
+                    }
+                ],
+            })
+
+    usage = anthropic_resp.get("usage", {})
+    return {
+        "id": resp_id,
+        "object": "response",
+        "created_at": int(time.time()),
+        "model": model,
+        "output": output,
+        "usage": {
+            "input_tokens": usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0),
+            "total_tokens": (
+                usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+            ),
+        },
+    }

@@ -264,6 +264,9 @@ from transfermodel.responses_adapter import (  # noqa: E402
     responses_to_chat_request,
     chat_sse_to_responses_sse,
     chat_response_to_responses,
+    responses_to_anthropic_request,
+    anthropic_sse_to_responses_sse,
+    anthropic_response_to_responses,
 )
 
 
@@ -396,3 +399,119 @@ def _make_completed_sse(resp_id: str, model: str) -> str:
         "status": "completed",
     }
     return f"event: response.completed\ndata: {json.dumps(ev, ensure_ascii=False)}"
+
+
+async def forward_responses_anthropic(
+    base_url: str,
+    api_key: str,
+    request_headers: dict[str, str],
+    body_bytes: bytes,
+    timeout_seconds: int = 120,
+) -> StreamingResponse | JSONResponse:
+    """Forward Codex Responses requests to an Anthropic-compatible upstream."""
+
+    body = json.loads(body_bytes)
+    resp_id = body.get("id") or f"resp_{_uuid.uuid4().hex[:16]}"
+    model = body.get("model", "unknown")
+    is_stream = body.get("stream", False)
+
+    anthropic_body = responses_to_anthropic_request(body)
+    anthropic_bytes = json.dumps(anthropic_body).encode()
+
+    msgs_url = f"{base_url.rstrip('/')}/v1/messages"
+    outgoing_headers = rewrite_headers(
+        request_headers, base_url, api_key, "anthropic"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=float(timeout_seconds)) as client:
+            if is_stream:
+                upstream_resp = await client.send(
+                    client.build_request(
+                        "POST", msgs_url, headers=outgoing_headers,
+                        content=anthropic_bytes,
+                    ),
+                    stream=True,
+                )
+            else:
+                upstream_resp = await client.post(
+                    msgs_url, headers=outgoing_headers,
+                    content=anthropic_bytes,
+                )
+    except httpx.TimeoutException:
+        return JSONResponse(
+            {"error": {"message": "Upstream request timed out"}}, status_code=504)
+    except httpx.RequestError as e:
+        return JSONResponse(
+            {"error": {"message": f"Upstream connection failed: {str(e)}"}},
+            status_code=502)
+
+    if is_stream:
+        resp_headers = _filter_headers(upstream_resp.headers)
+
+        async def translated_anthropic_stream():
+            tracker = get_tracker()
+            buffer = b""
+            async for chunk in upstream_resp.aiter_bytes():
+                buffer += chunk
+                while b"\n\n" in buffer:
+                    raw, buffer = buffer.split(b"\n\n", 1)
+                    try:
+                        line = raw.decode("utf-8", errors="replace")
+                    except Exception:
+                        continue
+
+                    event_type = None
+                    data_json = None
+                    for part in line.split("\n"):
+                        if part.startswith("event: "):
+                            event_type = part[7:].strip()
+                        elif part.startswith("data: "):
+                            try:
+                                data_json = json.loads(part[6:])
+                            except json.JSONDecodeError:
+                                pass
+
+                    if event_type and data_json:
+                        # Track usage
+                        if event_type == "message_start":
+                            msg = data_json.get("message", {})
+                            usage = msg.get("usage", {})
+                            tracker.set_input_tokens(
+                                n=usage.get("input_tokens", 0),
+                                cache_read=usage.get("cache_read_input_tokens", 0),
+                                cache_write=usage.get("cache_creation_input_tokens", 0),
+                            )
+                        elif event_type == "content_block_delta":
+                            delta = data_json.get("delta", {})
+                            if delta.get("type") == "text_delta":
+                                tracker.append_text(delta.get("text", ""))
+                        elif event_type == "message_delta":
+                            usage = data_json.get("usage", {})
+                            tracker.set_output_tokens(usage.get("output_tokens", 0))
+
+                        results = anthropic_sse_to_responses_sse(
+                            event_type, data_json, resp_id, model)
+                        for translated in results:
+                            yield (translated + "\n").encode()
+
+            tracker.end_request()
+
+        return StreamingResponse(
+            translated_anthropic_stream(),
+            status_code=upstream_resp.status_code,
+            headers=resp_headers,
+            media_type="text/event-stream",
+        )
+
+    # Non-streaming
+    try:
+        anthropic_data = upstream_resp.json()
+    except json.JSONDecodeError:
+        return JSONResponse(
+            {"error": {"message": upstream_resp.text[:1000]}},
+            status_code=upstream_resp.status_code,
+        )
+
+    resp_data = anthropic_response_to_responses(anthropic_data, resp_id, model)
+    return JSONResponse(content=resp_data, status_code=upstream_resp.status_code)

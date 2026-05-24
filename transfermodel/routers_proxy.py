@@ -7,7 +7,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from transfermodel import config
-from transfermodel.proxy import forward_to_upstream, forward_responses
+from transfermodel.proxy import forward_to_upstream, forward_responses, forward_responses_anthropic
 from transfermodel.storage import load_providers
 from transfermodel.usage_tracker import get_tracker
 
@@ -53,7 +53,8 @@ async def proxy_openai(request: Request):
 
 @router.post("/v1/responses")
 async def proxy_responses(request: Request):
-    """Codex CLI uses the Responses API. Translate to Chat Completions."""
+    """Codex CLI uses the Responses API. Translate to Chat Completions
+    or Anthropic Messages depending on the provider type."""
     body = await request.body()
     try:
         data = json.loads(body)
@@ -68,9 +69,14 @@ async def proxy_responses(request: Request):
             {"error": {"message": "Missing 'model' in request body"}}, status_code=400
         )
 
+    # Try both provider types — prefer openai, fall back to anthropic
     provider, err = _find_provider(model, "openai")
+    use_anthropic = False
     if err:
-        return err
+        provider, err = _find_provider(model, "anthropic")
+        use_anthropic = True
+        if err:
+            return err
 
     tracker = get_tracker()
     tracker.start_request(provider.name, model, "responses")
@@ -78,20 +84,30 @@ async def proxy_responses(request: Request):
     client_ip = request.client.host if request.client else "?"
     stream = data.get("stream", False)
     logger.info(
-        "[%s] codex model=%s stream=%s → %s",
+        "[%s] codex model=%s stream=%s → %s (%s)",
         client_ip, model, stream, provider.name,
+        "anthropic" if use_anthropic else "openai",
     )
 
     t0 = time.monotonic()
     headers = dict(request.headers)
     try:
-        resp = await forward_responses(
-            base_url=provider.base_url,
-            api_key=provider.api_key,
-            request_headers=headers,
-            body_bytes=body,
-            timeout_seconds=provider.timeout_seconds,
-        )
+        if use_anthropic:
+            resp = await forward_responses_anthropic(
+                base_url=provider.base_url,
+                api_key=provider.api_key,
+                request_headers=headers,
+                body_bytes=body,
+                timeout_seconds=provider.timeout_seconds,
+            )
+        else:
+            resp = await forward_responses(
+                base_url=provider.base_url,
+                api_key=provider.api_key,
+                request_headers=headers,
+                body_bytes=body,
+                timeout_seconds=provider.timeout_seconds,
+            )
         elapsed = (time.monotonic() - t0) * 1000
         snap = tracker.get_snapshot()
         totals = tracker.get_totals()
