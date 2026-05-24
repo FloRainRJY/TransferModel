@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 
 import httpx
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -286,85 +287,187 @@ async def forward_responses(
 
     chat_body = responses_to_chat_request(body)
     chat_body_bytes = json.dumps(chat_body).encode()
-    logger.info("codex→chat request: %s", chat_body_bytes.decode()[:1500])
+    logger.info("codex→chat request: model=%s stream=%s max_tokens=%s",
+                chat_body.get("model"), chat_body.get("stream"), chat_body.get("max_tokens"))
 
     chat_url = f"{base_url.rstrip('/')}/v1/chat/completions"
     outgoing_headers = rewrite_headers(
         request_headers, base_url, api_key, "openai"
     )
 
+    client = httpx.AsyncClient(timeout=float(timeout_seconds))
     try:
-        async with httpx.AsyncClient(timeout=float(timeout_seconds)) as client:
-            if is_stream:
-                upstream_resp = await client.send(
-                    client.build_request(
-                        "POST", chat_url, headers=outgoing_headers,
-                        content=chat_body_bytes,
-                    ),
-                    stream=True,
-                )
-            else:
-                upstream_resp = await client.post(
-                    chat_url, headers=outgoing_headers,
+        if is_stream:
+            upstream_resp = await client.send(
+                client.build_request(
+                    "POST", chat_url, headers=outgoing_headers,
                     content=chat_body_bytes,
-                )
+                ),
+                stream=True,
+            )
+        else:
+            upstream_resp = await client.post(
+                chat_url, headers=outgoing_headers,
+                content=chat_body_bytes,
+            )
     except httpx.TimeoutException:
+        await client.aclose()
         return JSONResponse(
             {"error": {"message": "Upstream request timed out"}}, status_code=504
         )
     except httpx.RequestError as e:
+        await client.aclose()
         return JSONResponse(
             {"error": {"message": f"Upstream connection failed: {str(e)}"}},
             status_code=502,
         )
 
     if is_stream:
+        if upstream_resp.status_code >= 400:
+            await upstream_resp.aread()
+            body_text = upstream_resp.text[:1000]
+            logger.error("codex upstream error HTTP %s: %s", upstream_resp.status_code, body_text)
+            await client.aclose()
+            return JSONResponse(
+                {"error": {"message": f"Upstream error: {body_text}"}},
+                status_code=upstream_resp.status_code,
+            )
+
         resp_headers = _filter_headers(upstream_resp.headers)
 
         async def translated_stream():
             tracker = get_tracker()
+            msg_item_id = f"msg_{_uuid.uuid4().hex[:16]}"
+            reasoning_id = f"rs_{_uuid.uuid4().hex[:12]}"
+            item_added = False
+            reasoning_added = False
+            actual_text = ""
+            reasoning_text = ""
+            seq = 0
+            # Send response.created + response.in_progress immediately
+            created = _make_response_created_sse(resp_id, model)
+            logger.info("→ codex SSE: response.created")
+            yield (created + "\n").encode()
+            yield (_make_sse("response.in_progress", {
+                "response": {"id": resp_id, "object": "response", "model": model, "status": "in_progress"},
+            }) + "\n").encode()
             buffer = b""
-            first_event_sent = False
-            async for chunk in upstream_resp.aiter_bytes():
-                buffer += chunk
-                while b"\n\n" in buffer:
-                    raw, buffer = buffer.split(b"\n\n", 1)
-                    try:
-                        line = raw.decode("utf-8", errors="replace")
-                    except Exception:
-                        continue
-                    if line.startswith("data: ") and line[6:].strip() != "[DONE]":
+            event_count = 0
+            try:
+                async for chunk in upstream_resp.aiter_bytes():
+                    buffer += chunk
+                    while b"\n\n" in buffer:
+                        raw, buffer = buffer.split(b"\n\n", 1)
                         try:
-                            chat_data = json.loads(line[6:])
-                        except json.JSONDecodeError:
+                            line = raw.decode("utf-8", errors="replace")
+                        except Exception:
                             continue
-                        choices = chat_data.get("choices", [])
-                        if choices:
+                        if line.startswith("data: ") and line[6:].strip() != "[DONE]":
+                            try:
+                                chat_data = json.loads(line[6:])
+                            except json.JSONDecodeError:
+                                continue
+                            choices = chat_data.get("choices", [])
+                            if not choices:
+                                continue
                             delta = choices[0].get("delta", {})
-                            text = delta.get("content", "")
+                            text = delta.get("content") or ""
+                            reasoning = delta.get("reasoning_content") or ""
+
+                            # Emit item/part added on first chunk (even empty)
+                            if not item_added:
+                                item_added = True
+                                logger.info("→ codex SSE: output_item.added + content_part.added")
+                                yield (_make_sse("response.output_item.added", {
+                                    "output_index": 0,
+                                    "item": {"id": msg_item_id, "type": "message", "role": "assistant", "status": "in_progress", "content": []},
+                                    "sequence_number": seq,
+                                }) + "\n").encode(); seq += 1
+                                yield (_make_sse("response.content_part.added", {
+                                    "output_index": 0,
+                                    "content_index": 0,
+                                    "part": {"type": "output_text", "text": ""},
+                                    "sequence_number": seq,
+                                }) + "\n").encode(); seq += 1
+
+                            # Reasoning: separate output item + reasoning_text.delta
+                            if reasoning:
+                                if not reasoning_added:
+                                    reasoning_added = True
+                                    yield (_make_sse("response.output_item.added", {
+                                        "output_index": 1,
+                                        "item": {"id": reasoning_id, "type": "reasoning", "status": "in_progress"},
+                                        "sequence_number": seq,
+                                    }) + "\n").encode(); seq += 1
+                                reasoning_text += reasoning
+                                tracker.append_text(reasoning)
+                                event_count += 1
+                                yield (_make_sse("response.reasoning_text.delta", {
+                                    "output_index": 1,
+                                    "content_index": 0,
+                                    "delta": reasoning,
+                                    "sequence_number": seq,
+                                }) + "\n").encode(); seq += 1
+
+                            # Content: send as response.output_text.delta
                             if text:
+                                actual_text += text
                                 tracker.append_text(text)
+                                event_count += 1
+                                yield (_make_sse("response.output_text.delta", {
+                                    "item_id": msg_item_id,
+                                    "output_index": 0,
+                                    "content_index": 0,
+                                    "delta": text,
+                                    "sequence_number": seq,
+                                }) + "\n").encode(); seq += 1
+
                             usage = chat_data.get("usage")
                             if usage:
-                                tracker.set_input_tokens(
-                                    usage.get("prompt_tokens", 0))
-                                tracker.set_output_tokens(
-                                    usage.get("completion_tokens", 0))
-                        translated = chat_sse_to_responses_sse(
-                            line, resp_id, model)
-                        if translated:
-                            if not first_event_sent:
-                                created = _make_response_created_sse(
-                                    resp_id, model)
-                                yield (created + "\n").encode()
-                                first_event_sent = True
-                            yield (translated + "\n").encode()
+                                tracker.set_input_tokens(usage.get("prompt_tokens", 0))
+                                tracker.set_output_tokens(usage.get("completion_tokens", 0))
+            finally:
+                logger.info("→ codex SSE: total %d events, closing stream", event_count)
+                if actual_text:
+                    yield (_make_sse("response.output_text.done", {
+                        "output_index": 0, "content_index": 0, "text": actual_text,
+                        "sequence_number": seq,
+                    }) + "\n").encode(); seq += 1
+                    yield (_make_sse("response.content_part.done", {
+                        "output_index": 0, "content_index": 0,
+                        "part": {"type": "output_text", "text": actual_text},
+                        "sequence_number": seq,
+                    }) + "\n").encode(); seq += 1
+                yield (_make_sse("response.output_item.done", {
+                    "output_index": 0,
+                    "item": {"id": msg_item_id, "type": "message", "role": "assistant", "status": "completed",
+                             "content": [{"type": "output_text", "text": actual_text}] if actual_text else []},
+                    "sequence_number": seq,
+                }) + "\n").encode(); seq += 1
+                if reasoning_added:
+                    yield (_make_sse("response.output_item.done", {
+                        "output_index": 1,
+                        "item": {"id": reasoning_id, "type": "reasoning", "status": "completed",
+                                 "content": [{"type": "output_text", "text": reasoning_text}]},
+                        "sequence_number": seq,
+                    }) + "\n").encode(); seq += 1
+                yield (_make_completed_sse(resp_id, model, msg_item_id, actual_text,
+                                            reasoning_id if reasoning_added else "",
+                                            reasoning_text if reasoning_added else "") + "\n").encode()
+                tracker.end_request()
+                await client.aclose()
 
-            yield _make_completed_sse(resp_id, model).encode()
-            tracker.end_request()
-
+        # Dump the first 3 events to debug
+        import asyncio
+        async def debug_stream():
+            count = 0
+            async for chunk in translated_stream():
+                if count < 3:
+                    logger.info("DEBUG RAW SSE EVENT: %s", chunk.decode()[:500])
+                count += 1
+                yield chunk
         return StreamingResponse(
-            translated_stream(),
+            debug_stream(),
             status_code=upstream_resp.status_code,
             headers=resp_headers,
             media_type="text/event-stream",
@@ -374,33 +477,70 @@ async def forward_responses(
     try:
         chat_data = upstream_resp.json()
     except json.JSONDecodeError:
+        await client.aclose()
         return JSONResponse(
             {"error": {"message": upstream_resp.text[:1000]}},
             status_code=upstream_resp.status_code,
         )
 
     resp_data = chat_response_to_responses(chat_data, resp_id, model)
+    logger.info("DEBUG NON-STREAM RESPONSE: %s", json.dumps(resp_data)[:500])
+    await client.aclose()
     return JSONResponse(content=resp_data, status_code=upstream_resp.status_code)
 
 
+def _make_sse(event_type: str, data: dict) -> str:
+    ev = {**data, "type": event_type}
+    return f"event: {event_type}\ndata: {json.dumps(ev, ensure_ascii=False)}"
+
+
 def _make_response_created_sse(resp_id: str, model: str) -> str:
-    ev = {
-        "id": resp_id,
-        "object": "response",
-        "model": model,
-        "output": [],
-    }
-    return f"event: response.created\ndata: {json.dumps(ev, ensure_ascii=False)}"
+    return _make_sse("response.created", {
+        "response": {
+            "id": resp_id,
+            "object": "response",
+            "status": "in_progress",
+            "model": model,
+            "created_at": int(time.time()),
+            "output": [],
+        },
+    })
 
 
-def _make_completed_sse(resp_id: str, model: str) -> str:
-    ev = {
-        "id": resp_id,
-        "object": "response",
-        "model": model,
-        "status": "completed",
-    }
-    return f"event: response.completed\ndata: {json.dumps(ev, ensure_ascii=False)}"
+def _make_completed_sse(resp_id: str, model: str, msg_item_id: str = "", response_text: str = "",
+                        reasoning_id: str = "", reasoning_text: str = "") -> str:
+    snap = get_tracker().get_snapshot()
+    output = []
+    if msg_item_id:
+        output.append({
+            "id": msg_item_id,
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": response_text}] if response_text else [],
+        })
+    if reasoning_id and reasoning_text:
+        output.append({
+            "id": reasoning_id,
+            "type": "reasoning",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": reasoning_text}],
+        })
+    return _make_sse("response.completed", {
+        "response": {
+            "id": resp_id,
+            "object": "response",
+            "status": "completed",
+            "model": model,
+            "created_at": int(time.time()),
+            "output": output,
+            "usage": {
+                "input_tokens": snap.input_tokens,
+                "output_tokens": snap.output_tokens,
+                "total_tokens": snap.input_tokens + snap.output_tokens,
+            },
+        },
+    })
 
 
 async def forward_responses_anthropic(
@@ -426,25 +566,27 @@ async def forward_responses_anthropic(
         request_headers, base_url, api_key, "anthropic"
     )
 
+    client = httpx.AsyncClient(timeout=float(timeout_seconds))
     try:
-        async with httpx.AsyncClient(timeout=float(timeout_seconds)) as client:
-            if is_stream:
-                upstream_resp = await client.send(
-                    client.build_request(
-                        "POST", msgs_url, headers=outgoing_headers,
-                        content=anthropic_bytes,
-                    ),
-                    stream=True,
-                )
-            else:
-                upstream_resp = await client.post(
-                    msgs_url, headers=outgoing_headers,
+        if is_stream:
+            upstream_resp = await client.send(
+                client.build_request(
+                    "POST", msgs_url, headers=outgoing_headers,
                     content=anthropic_bytes,
-                )
+                ),
+                stream=True,
+            )
+        else:
+            upstream_resp = await client.post(
+                msgs_url, headers=outgoing_headers,
+                content=anthropic_bytes,
+            )
     except httpx.TimeoutException:
+        await client.aclose()
         return JSONResponse(
             {"error": {"message": "Upstream request timed out"}}, status_code=504)
     except httpx.RequestError as e:
+        await client.aclose()
         return JSONResponse(
             {"error": {"message": f"Upstream connection failed: {str(e)}"}},
             status_code=502)
@@ -452,11 +594,12 @@ async def forward_responses_anthropic(
     if is_stream:
         ct = upstream_resp.headers.get("content-type", "")
         if not ct.startswith("text/event-stream"):
-            # Upstream returned non-SSE (likely an error or non-streaming)
+            await upstream_resp.aread()
             logger.warning(
                 "Expected SSE but got %s, body: %s",
                 ct, upstream_resp.text[:500],
             )
+            await client.aclose()
             return JSONResponse(
                 {"error": {"message": upstream_resp.text[:1000]}},
                 status_code=upstream_resp.status_code,
@@ -466,6 +609,14 @@ async def forward_responses_anthropic(
 
         async def translated_anthropic_stream():
             tracker = get_tracker()
+            msg_item_id = f"msg_{_uuid.uuid4().hex[:16]}"
+            reasoning_id = f"rs_{_uuid.uuid4().hex[:12]}"
+            seq = 0
+            started = False
+            item_added = False
+            reasoning_added = False
+            actual_text = ""
+            reasoning_text = ""
             buffer = b""
             try:
                 async for chunk in upstream_resp.aiter_bytes():
@@ -488,35 +639,129 @@ async def forward_responses_anthropic(
                                 except json.JSONDecodeError:
                                     pass
 
-                        if event_type and data_json:
-                            # Track usage
-                            if event_type == "message_start":
-                                msg = data_json.get("message", {})
-                                usage = msg.get("usage", {})
-                                tracker.set_input_tokens(
-                                    n=usage.get("input_tokens", 0),
-                                    cache_read=usage.get("cache_read_input_tokens", 0),
-                                    cache_write=usage.get("cache_creation_input_tokens", 0),
-                                )
-                            elif event_type == "content_block_delta":
-                                delta = data_json.get("delta", {})
-                                if delta.get("type") == "text_delta":
-                                    tracker.append_text(delta.get("text", ""))
-                            elif event_type == "message_delta":
-                                usage = data_json.get("usage", {})
-                                tracker.set_output_tokens(usage.get("output_tokens", 0))
+                        if not event_type or not data_json:
+                            continue
 
-                            results = anthropic_sse_to_responses_sse(
-                                event_type, data_json, resp_id, model)
-                            for translated in results:
-                                yield (translated + "\n").encode()
+                        if event_type == "message_start":
+                            msg = data_json.get("message", {})
+                            usage = msg.get("usage", {})
+                            tracker.set_input_tokens(
+                                n=usage.get("input_tokens", 0),
+                                cache_read=usage.get("cache_read_input_tokens", 0),
+                                cache_write=usage.get("cache_creation_input_tokens", 0),
+                            )
+                            stream_model = msg.get("model") or model
+                            if not started:
+                                started = True
+                                yield (_make_sse("response.created", {
+                                    "response": {
+                                        "id": resp_id, "object": "response", "status": "in_progress",
+                                        "model": stream_model, "created_at": int(time.time()), "output": [],
+                                    },
+                                    "sequence_number": seq,
+                                }) + "\n").encode(); seq += 1
+                                yield (_make_sse("response.in_progress", {
+                                    "response": {"id": resp_id, "object": "response", "model": stream_model, "status": "in_progress"},
+                                    "sequence_number": seq,
+                                }) + "\n").encode(); seq += 1
+                                # Always emit message item (even before text appears)
+                                item_added = True
+                                yield (_make_sse("response.output_item.added", {
+                                    "output_index": 0,
+                                    "item": {"id": msg_item_id, "type": "message", "role": "assistant", "status": "in_progress", "content": []},
+                                    "sequence_number": seq,
+                                }) + "\n").encode(); seq += 1
+                                yield (_make_sse("response.content_part.added", {
+                                    "output_index": 0, "content_index": 0,
+                                    "part": {"type": "output_text", "text": ""},
+                                    "sequence_number": seq,
+                                }) + "\n").encode(); seq += 1
+
+                        elif event_type == "content_block_start":
+                            cb = data_json.get("content_block", {})
+                            cb_type = cb.get("type", "")
+                            if cb_type == "text":
+                                pass  # message item already added at stream start
+                            elif cb_type == "thinking":
+                                if not reasoning_added:
+                                    reasoning_added = True
+                                    yield (_make_sse("response.output_item.added", {
+                                        "output_index": 1,
+                                        "item": {"id": reasoning_id, "type": "reasoning", "status": "in_progress"},
+                                        "sequence_number": seq,
+                                    }) + "\n").encode(); seq += 1
+
+                        elif event_type == "content_block_delta":
+                            delta = data_json.get("delta", {})
+                            delta_type = delta.get("type", "")
+                            if delta_type == "text_delta":
+                                text = delta.get("text", "")
+                                if text:
+                                    actual_text += text
+                                    tracker.append_text(text)
+                                    yield (_make_sse("response.output_text.delta", {
+                                        "item_id": msg_item_id, "output_index": 0, "content_index": 0,
+                                        "delta": text, "sequence_number": seq,
+                                    }) + "\n").encode(); seq += 1
+                            elif delta_type == "thinking_delta":
+                                thinking = delta.get("thinking", "")
+                                if thinking:
+                                    reasoning_text += thinking
+                                    tracker.append_text(thinking)
+                                    yield (_make_sse("response.reasoning_text.delta", {
+                                        "output_index": 1, "content_index": 0,
+                                        "delta": thinking, "sequence_number": seq,
+                                    }) + "\n").encode(); seq += 1
+
+                        elif event_type == "content_block_stop":
+                            pass  # handled at message_stop
+
+                        elif event_type == "message_delta":
+                            usage = data_json.get("usage", {})
+                            tracker.set_output_tokens(usage.get("output_tokens", 0))
+
+                        elif event_type == "message_stop":
+                            if actual_text:
+                                yield (_make_sse("response.output_text.done", {
+                                    "output_index": 0, "content_index": 0, "text": actual_text,
+                                    "sequence_number": seq,
+                                }) + "\n").encode(); seq += 1
+                                yield (_make_sse("response.content_part.done", {
+                                    "output_index": 0, "content_index": 0,
+                                    "part": {"type": "output_text", "text": actual_text},
+                                    "sequence_number": seq,
+                                }) + "\n").encode(); seq += 1
+                            yield (_make_sse("response.output_item.done", {
+                                "output_index": 0,
+                                "item": {"id": msg_item_id, "type": "message", "role": "assistant", "status": "completed",
+                                         "content": [{"type": "output_text", "text": actual_text}] if actual_text else []},
+                                "sequence_number": seq,
+                            }) + "\n").encode(); seq += 1
+                            if reasoning_added:
+                                yield (_make_sse("response.output_item.done", {
+                                    "output_index": 1,
+                                    "item": {"id": reasoning_id, "type": "reasoning", "status": "completed",
+                                             "content": [{"type": "output_text", "text": reasoning_text}]},
+                                    "sequence_number": seq,
+                                }) + "\n").encode(); seq += 1
+                            yield (_make_completed_sse(resp_id, model, msg_item_id, actual_text,
+                                                        reasoning_id if reasoning_added else "",
+                                                        reasoning_text if reasoning_added else "") + "\n").encode()
             except Exception:
                 logger.warning("Stream read interrupted", exc_info=True)
             finally:
                 tracker.end_request()
+                await client.aclose()
 
+        async def debug_anthropic_stream():
+            count = 0
+            async for chunk in translated_anthropic_stream():
+                if count < 3:
+                    logger.info("DEBUG ANTHROPIC SSE EVENT: %s", chunk.decode()[:500])
+                    count += 1
+                yield chunk
         return StreamingResponse(
-            translated_anthropic_stream(),
+            debug_anthropic_stream(),
             status_code=upstream_resp.status_code,
             headers=resp_headers,
             media_type="text/event-stream",
@@ -526,10 +771,12 @@ async def forward_responses_anthropic(
     try:
         anthropic_data = upstream_resp.json()
     except json.JSONDecodeError:
+        await client.aclose()
         return JSONResponse(
             {"error": {"message": upstream_resp.text[:1000]}},
             status_code=upstream_resp.status_code,
         )
 
     resp_data = anthropic_response_to_responses(anthropic_data, resp_id, model)
+    await client.aclose()
     return JSONResponse(content=resp_data, status_code=upstream_resp.status_code)

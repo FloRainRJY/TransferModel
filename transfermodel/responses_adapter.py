@@ -49,6 +49,10 @@ def responses_to_chat_request(body: dict) -> dict:
     if "tool_choice" in body:
         chat_body["tool_choice"] = body["tool_choice"]
 
+    # Ensure max_tokens is set — DeepSeek V4 defaults can be too low
+    if "max_tokens" not in chat_body or not chat_body["max_tokens"]:
+        chat_body["max_tokens"] = 4096
+
     return chat_body
 
 
@@ -57,6 +61,8 @@ def _input_block_to_message(block: dict) -> dict | None:
         return None
     btype = block.get("type", "")
     role = block.get("role", "user")
+    if role == "developer":
+        role = "system"
     content = block.get("content", "")
 
     if btype == "message":
@@ -100,12 +106,20 @@ def _input_block_to_message(block: dict) -> dict | None:
 def _convert_tools(tools: list) -> list:
     out = []
     for t in tools:
+        name = (t.get("name") or "").strip()
+        if not name:
+            continue
+        params = t.get("parameters")
+        if not isinstance(params, dict):
+            params = {"type": "object", "properties": {}}
+        elif params.get("type") is None:
+            params = {**params, "type": "object"}
         out.append({
             "type": "function",
             "function": {
-                "name": t.get("name", ""),
+                "name": name,
                 "description": t.get("description", ""),
-                "parameters": t.get("parameters", {}),
+                "parameters": params,
             },
         })
     return out
@@ -115,7 +129,7 @@ def _convert_tools(tools: list) -> list:
 # Response: Chat Completions SSE → Responses API SSE
 # ---------------------------------------------------------------------------
 
-def chat_sse_to_responses_sse(line: str, resp_id: str, model: str) -> str | None:
+def chat_sse_to_responses_sse(line: str, resp_id: str, model: str, item_id: str = "msg_000", seq: int = 0) -> str | None:
     """Convert one Chat-Completions SSE line to a Responses-API SSE event.
 
     Returns a string (including "event:" and "data:" lines) or None
@@ -160,31 +174,29 @@ def chat_sse_to_responses_sse(line: str, resp_id: str, model: str) -> str | None
             }
             events.append(ev)
 
-    # Text delta
-    text = delta.get("content", "")
-    if text:
+    # Text delta — include both content and reasoning_content
+    text = delta.get("content") or ""
+    reasoning = delta.get("reasoning_content") or ""
+    combined = reasoning + text
+    if combined:
         events.append({
             "type": "response.output_text.delta",
-            "delta": text,
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "delta": combined,
+            "sequence_number": seq,
         })
 
-    # Finish
-    if finish_reason:
-        events.append({
-            "type": "response.completed",
-            "response": {
-                "id": resp_id,
-                "object": "response",
-                "model": model,
-            },
-        })
+    # Finish — handled by stream generator, don't emit here
+    # (prevents duplicate response.completed events)
 
     if not events:
         return None
 
     parts = []
     for ev in events:
-        etype = ev.pop("type", "")
+        etype = ev["type"]
         parts.append(f"event: {etype}")
         parts.append(f"data: {json.dumps(ev, ensure_ascii=False)}")
     return "\n".join(parts) + "\n"
@@ -293,6 +305,25 @@ def responses_to_anthropic_request(body: dict) -> dict:
         anthropic["top_p"] = body["top_p"]
     if "stop" in body:
         anthropic["stop_sequences"] = body["stop"]
+
+    # Convert tools to Anthropic format
+    tools = body.get("tools", [])
+    if tools:
+        anthropic_tools = []
+        for t in tools:
+            name = t.get("name") or ""
+            if isinstance(name, str):
+                name = name.strip()
+            if not name:
+                continue
+            fn = t.get("function", {})
+            anthropic_tools.append({
+                "name": fn.get("name", name) if fn else name,
+                "description": fn.get("description", "") if fn else t.get("description", ""),
+                "input_schema": fn.get("parameters", {"type": "object", "properties": {}}) if fn else t.get("parameters", {"type": "object", "properties": {}}),
+            })
+        if anthropic_tools:
+            anthropic["tools"] = anthropic_tools
 
     return anthropic
 

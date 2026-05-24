@@ -8,9 +8,9 @@
 
 [English](#english) | [中文](#中文)
 
-本地 LLM API 桌面代理 — 图形化配置、多上游转发、实时 Token 统计。
+本地 LLM API 桌面代理 — 图形化配置、多上游转发、实时 Token 统计。支持 Claude Code。
 
-A local LLM API desktop proxy with GUI configuration, multi-upstream routing, and real-time token tracking.
+A local LLM API desktop proxy with GUI configuration, multi-upstream routing, and real-time token tracking. Works with Claude Code.
 
 ---
 
@@ -18,7 +18,7 @@ A local LLM API desktop proxy with GUI configuration, multi-upstream routing, an
 
 ### 简介
 
-TransferModel 是一个本地桌面代理应用，在 AI 编码工具（Claude Code、Codex）和 LLM API 提供商之间架设中转层。上游 API Key 只保存在本地，下游工具无需接触真实密钥。
+TransferModel 是一个本地桌面代理应用，在 AI 编码工具（如 Claude Code）和 LLM API 提供商之间架设中转层。上游 API Key 只保存在本地，下游工具无需接触真实密钥。
 
 ### 功能
 
@@ -105,29 +105,6 @@ $env:ANTHROPIC_AUTH_TOKEN="any-value"
 $env:ANTHROPIC_MODEL="deepseek-v4-pro"
 ```
 
-**Codex CLI：**
-
-创建 `~/.codex/config.toml`：
-
-```toml
-model = "deepseek-v4-pro"
-model_provider = "transfermodel"
-
-[model_providers.transfermodel]
-name = "TransferModel"
-base_url = "http://127.0.0.1:8080/v1"
-wire_api = "responses"
-requires_openai_auth = false
-api_key = "OPENAI_API_KEY"
-```
-
-```bash
-export OPENAI_API_KEY=any-value
-codex "hello"
-```
-
-> Codex CLI 使用 Responses API (`/v1/responses`)，代理会自动将其翻译为 Chat Completions 格式转发给上游。
-
 建议写入 shell 配置文件（`~/.zshrc` / `~/.bashrc` / Windows 系统环境变量）。
 
 ### 模型路由
@@ -196,7 +173,7 @@ MIT License — 详见 [LICENSE](LICENSE)。
 
 ### Overview
 
-TransferModel is a local desktop proxy that sits between AI coding tools (Claude Code, Codex) and LLM API providers. Upstream API keys are stored only in the proxy — downstream tools never touch them.
+TransferModel is a local desktop proxy that sits between AI coding tools (e.g. Claude Code) and LLM API providers. Upstream API keys are stored only in the proxy — downstream tools never touch them.
 
 ### Features
 
@@ -282,29 +259,6 @@ $env:ANTHROPIC_BASE_URL="http://127.0.0.1:8080"
 $env:ANTHROPIC_AUTH_TOKEN="any-value"
 $env:ANTHROPIC_MODEL="deepseek-v4-pro"
 ```
-
-**Codex CLI:**
-
-Create `~/.codex/config.toml`:
-
-```toml
-model = "deepseek-v4-pro"
-model_provider = "transfermodel"
-
-[model_providers.transfermodel]
-name = "TransferModel"
-base_url = "http://127.0.0.1:8080/v1"
-wire_api = "responses"
-requires_openai_auth = false
-api_key = "OPENAI_API_KEY"
-```
-
-```bash
-export OPENAI_API_KEY=any-value
-codex "hello"
-```
-
-> Codex CLI uses the Responses API (`/v1/responses`). The proxy translates it to Chat Completions format for upstream providers.
 
 Persist these in your shell config (`~/.zshrc` / `~/.bashrc` / Windows system environment).
 

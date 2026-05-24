@@ -69,6 +69,14 @@ async def proxy_responses(request: Request):
             {"error": {"message": "Missing 'model' in request body"}}, status_code=400
         )
 
+    # Log key params + headers for debugging
+    logger.info("codex params: max_output_tokens=%s temperature=%s tools=%s top_p=%s",
+                data.get("max_output_tokens"), data.get("temperature"),
+                len(data.get("tools", [])) if data.get("tools") else 0,
+                data.get("top_p"))
+    logger.info("codex headers: %s", {k: v for k, v in request.headers.items()
+                                       if k.lower() in ("x-codex-turn-state", "user-agent", "openai-beta", "content-type")})
+
     # Try both provider types — prefer openai, fall back to anthropic
     provider, err = _find_provider(model, "openai")
     use_anthropic = False
