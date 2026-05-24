@@ -88,6 +88,7 @@ async def proxy_responses(request: Request):
         client_ip, model, stream, provider.name,
         "anthropic" if use_anthropic else "openai",
     )
+    logger.debug("[%s] codex raw input: %s", client_ip, body.decode()[:1000])
 
     t0 = time.monotonic()
     headers = dict(request.headers)

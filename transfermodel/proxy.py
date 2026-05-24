@@ -286,6 +286,8 @@ async def forward_responses(
 
     chat_body = responses_to_chat_request(body)
     chat_body_bytes = json.dumps(chat_body).encode()
+    logger.info("codex→chat request: %s", chat_body_bytes.decode()[:1500])
+
     chat_url = f"{base_url.rstrip('/')}/v1/chat/completions"
     outgoing_headers = rewrite_headers(
         request_headers, base_url, api_key, "openai"
@@ -417,6 +419,7 @@ async def forward_responses_anthropic(
 
     anthropic_body = responses_to_anthropic_request(body)
     anthropic_bytes = json.dumps(anthropic_body).encode()
+    logger.info("codex→anthropic request: %s", anthropic_bytes.decode()[:1500])
 
     msgs_url = f"{base_url.rstrip('/')}/v1/messages"
     outgoing_headers = rewrite_headers(
