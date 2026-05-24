@@ -105,12 +105,28 @@ $env:ANTHROPIC_AUTH_TOKEN="any-value"
 $env:ANTHROPIC_MODEL="deepseek-v4-pro"
 ```
 
-**Codex / OpenAI CLI：**
+**Codex CLI：**
+
+创建 `~/.codex/config.toml`：
+
+```toml
+model = "deepseek-v4-pro"
+model_provider = "transfermodel"
+
+[model_providers.transfermodel]
+name = "TransferModel"
+base_url = "http://127.0.0.1:8080/v1"
+wire_api = "responses"
+requires_openai_auth = false
+env_key = "OPENAI_API_KEY"
+```
 
 ```bash
-export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
 export OPENAI_API_KEY=any-value
+codex "hello"
 ```
+
+> Codex CLI 使用 Responses API (`/v1/responses`)，代理会自动将其翻译为 Chat Completions 格式转发给上游。
 
 建议写入 shell 配置文件（`~/.zshrc` / `~/.bashrc` / Windows 系统环境变量）。
 
@@ -267,12 +283,28 @@ $env:ANTHROPIC_AUTH_TOKEN="any-value"
 $env:ANTHROPIC_MODEL="deepseek-v4-pro"
 ```
 
-**Codex / OpenAI CLI:**
+**Codex CLI:**
+
+Create `~/.codex/config.toml`:
+
+```toml
+model = "deepseek-v4-pro"
+model_provider = "transfermodel"
+
+[model_providers.transfermodel]
+name = "TransferModel"
+base_url = "http://127.0.0.1:8080/v1"
+wire_api = "responses"
+requires_openai_auth = false
+env_key = "OPENAI_API_KEY"
+```
 
 ```bash
-export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
 export OPENAI_API_KEY=any-value
+codex "hello"
 ```
+
+> Codex CLI uses the Responses API (`/v1/responses`). The proxy translates it to Chat Completions format for upstream providers.
 
 Persist these in your shell config (`~/.zshrc` / `~/.bashrc` / Windows system environment).
 
