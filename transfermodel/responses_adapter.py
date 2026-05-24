@@ -263,15 +263,21 @@ def responses_to_anthropic_request(body: dict) -> dict:
             role = block.get("role", "user")
             content = block.get("content", "")
 
+            text = ""
             if isinstance(content, list):
                 text_bits = []
                 for c in content:
                     ct = c.get("type", "")
                     if ct in ("input_text", "output_text"):
                         text_bits.append(c.get("text", ""))
-                messages.append({"role": role, "content": " ".join(text_bits)})
+                text = " ".join(text_bits)
             elif isinstance(content, str):
-                messages.append({"role": role, "content": content})
+                text = content
+
+            if role in ("developer", "system"):
+                system_parts.append(text)
+            else:
+                messages.append({"role": role, "content": text})
 
     anthropic = {
         "model": body.get("model", ""),
