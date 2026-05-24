@@ -139,8 +139,12 @@ class ProviderDialog(QDialog):
             auth_method = f"Authorization: Bearer {key_masked}"
 
         test_model = provider.models[0] if provider.models else "unknown"
-        msgs_url = f"{base}/v1/messages"
-        test_body = {"model": test_model, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
+        if api_type == "anthropic":
+            msgs_url = f"{base}/v1/messages"
+            test_body = {"model": test_model, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
+        else:
+            msgs_url = f"{base}/chat/completions"
+            test_body = {"model": test_model, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
 
         lines = [
             f"URL: {msgs_url}",
