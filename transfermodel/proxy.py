@@ -455,50 +455,53 @@ async def forward_responses_anthropic(
         async def translated_anthropic_stream():
             tracker = get_tracker()
             buffer = b""
-            async for chunk in upstream_resp.aiter_bytes():
-                buffer += chunk
-                while b"\n\n" in buffer:
-                    raw, buffer = buffer.split(b"\n\n", 1)
-                    try:
-                        line = raw.decode("utf-8", errors="replace")
-                    except Exception:
-                        continue
+            try:
+                async for chunk in upstream_resp.aiter_bytes():
+                    buffer += chunk
+                    while b"\n\n" in buffer:
+                        raw, buffer = buffer.split(b"\n\n", 1)
+                        try:
+                            line = raw.decode("utf-8", errors="replace")
+                        except Exception:
+                            continue
 
-                    event_type = None
-                    data_json = None
-                    for part in line.split("\n"):
-                        if part.startswith("event: "):
-                            event_type = part[7:].strip()
-                        elif part.startswith("data: "):
-                            try:
-                                data_json = json.loads(part[6:])
-                            except json.JSONDecodeError:
-                                pass
+                        event_type = None
+                        data_json = None
+                        for part in line.split("\n"):
+                            if part.startswith("event: "):
+                                event_type = part[7:].strip()
+                            elif part.startswith("data: "):
+                                try:
+                                    data_json = json.loads(part[6:])
+                                except json.JSONDecodeError:
+                                    pass
 
-                    if event_type and data_json:
-                        # Track usage
-                        if event_type == "message_start":
-                            msg = data_json.get("message", {})
-                            usage = msg.get("usage", {})
-                            tracker.set_input_tokens(
-                                n=usage.get("input_tokens", 0),
-                                cache_read=usage.get("cache_read_input_tokens", 0),
-                                cache_write=usage.get("cache_creation_input_tokens", 0),
-                            )
-                        elif event_type == "content_block_delta":
-                            delta = data_json.get("delta", {})
-                            if delta.get("type") == "text_delta":
-                                tracker.append_text(delta.get("text", ""))
-                        elif event_type == "message_delta":
-                            usage = data_json.get("usage", {})
-                            tracker.set_output_tokens(usage.get("output_tokens", 0))
+                        if event_type and data_json:
+                            # Track usage
+                            if event_type == "message_start":
+                                msg = data_json.get("message", {})
+                                usage = msg.get("usage", {})
+                                tracker.set_input_tokens(
+                                    n=usage.get("input_tokens", 0),
+                                    cache_read=usage.get("cache_read_input_tokens", 0),
+                                    cache_write=usage.get("cache_creation_input_tokens", 0),
+                                )
+                            elif event_type == "content_block_delta":
+                                delta = data_json.get("delta", {})
+                                if delta.get("type") == "text_delta":
+                                    tracker.append_text(delta.get("text", ""))
+                            elif event_type == "message_delta":
+                                usage = data_json.get("usage", {})
+                                tracker.set_output_tokens(usage.get("output_tokens", 0))
 
-                        results = anthropic_sse_to_responses_sse(
-                            event_type, data_json, resp_id, model)
-                        for translated in results:
-                            yield (translated + "\n").encode()
-
-            tracker.end_request()
+                            results = anthropic_sse_to_responses_sse(
+                                event_type, data_json, resp_id, model)
+                            for translated in results:
+                                yield (translated + "\n").encode()
+            except Exception:
+                logger.warning("Stream read interrupted", exc_info=True)
+            finally:
+                tracker.end_request()
 
         return StreamingResponse(
             translated_anthropic_stream(),
