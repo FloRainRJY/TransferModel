@@ -7,7 +7,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from transfermodel import config
-from transfermodel.proxy import forward_to_upstream
+from transfermodel.proxy import forward_to_upstream, forward_responses
 from transfermodel.storage import load_providers
 from transfermodel.usage_tracker import get_tracker
 
@@ -49,6 +49,67 @@ async def proxy_anthropic(request: Request):
 @router.post("/v1/chat/completions")
 async def proxy_openai(request: Request):
     return await _handle_proxy(request, "openai", "/v1/chat/completions")
+
+
+@router.post("/v1/responses")
+async def proxy_responses(request: Request):
+    """Codex CLI uses the Responses API. Translate to Chat Completions."""
+    body = await request.body()
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return JSONResponse(
+            {"error": {"message": "Invalid JSON body"}}, status_code=400
+        )
+
+    model = data.get("model", "")
+    if not model:
+        return JSONResponse(
+            {"error": {"message": "Missing 'model' in request body"}}, status_code=400
+        )
+
+    provider, err = _find_provider(model, "openai")
+    if err:
+        return err
+
+    tracker = get_tracker()
+    tracker.start_request(provider.name, model, "responses")
+
+    client_ip = request.client.host if request.client else "?"
+    stream = data.get("stream", False)
+    logger.info(
+        "[%s] codex model=%s stream=%s → %s",
+        client_ip, model, stream, provider.name,
+    )
+
+    t0 = time.monotonic()
+    headers = dict(request.headers)
+    try:
+        resp = await forward_responses(
+            base_url=provider.base_url,
+            api_key=provider.api_key,
+            request_headers=headers,
+            body_bytes=body,
+            timeout_seconds=provider.timeout_seconds,
+        )
+        elapsed = (time.monotonic() - t0) * 1000
+        snap = tracker.get_snapshot()
+        totals = tracker.get_totals()
+        logger.info(
+            "[%s] codex model=%s → HTTP %s (%.0fms) "
+            "tokens: in=%d out=%d | total: in=%d out=%d",
+            client_ip, model, resp.status_code, elapsed,
+            snap.input_tokens, snap.output_tokens,
+            totals["total_input"], totals["total_output"],
+        )
+        return resp
+    except Exception as e:
+        elapsed = (time.monotonic() - t0) * 1000
+        logger.error(
+            "[%s] codex model=%s → ERROR %s (%.0fms)",
+            client_ip, model, e, elapsed,
+        )
+        raise
 
 
 async def _handle_proxy(request: Request, api_type: str, path: str):

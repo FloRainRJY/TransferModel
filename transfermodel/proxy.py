@@ -252,3 +252,147 @@ def _extract_nonstream_usage(resp_json: dict, api_type: str):
             msg = choice.get("message", {})
             tracker.append_text(msg.get("content", ""))
     tracker.end_request()
+
+
+# ---------------------------------------------------------------------------
+# Responses API adapter (Codex CLI)
+# ---------------------------------------------------------------------------
+
+import uuid as _uuid  # noqa: E402
+
+from transfermodel.responses_adapter import (  # noqa: E402
+    responses_to_chat_request,
+    chat_sse_to_responses_sse,
+    chat_response_to_responses,
+)
+
+
+async def forward_responses(
+    base_url: str,
+    api_key: str,
+    request_headers: dict[str, str],
+    body_bytes: bytes,
+    timeout_seconds: int = 120,
+) -> StreamingResponse | JSONResponse:
+    """Forward a Responses-API request via Chat-Completions upstream."""
+
+    body = json.loads(body_bytes)
+    resp_id = body.get("id") or f"resp_{_uuid.uuid4().hex[:16]}"
+    model = body.get("model", "unknown")
+    is_stream = body.get("stream", False)
+
+    chat_body = responses_to_chat_request(body)
+    chat_body_bytes = json.dumps(chat_body).encode()
+    chat_url = f"{base_url.rstrip('/')}/chat/completions"
+    outgoing_headers = rewrite_headers(
+        request_headers, base_url, api_key, "openai"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=float(timeout_seconds)) as client:
+            if is_stream:
+                upstream_resp = await client.send(
+                    client.build_request(
+                        "POST", chat_url, headers=outgoing_headers,
+                        content=chat_body_bytes,
+                    ),
+                    stream=True,
+                )
+            else:
+                upstream_resp = await client.post(
+                    chat_url, headers=outgoing_headers,
+                    content=chat_body_bytes,
+                )
+    except httpx.TimeoutException:
+        return JSONResponse(
+            {"error": {"message": "Upstream request timed out"}}, status_code=504
+        )
+    except httpx.RequestError as e:
+        return JSONResponse(
+            {"error": {"message": f"Upstream connection failed: {str(e)}"}},
+            status_code=502,
+        )
+
+    if is_stream:
+        resp_headers = _filter_headers(upstream_resp.headers)
+
+        async def translated_stream():
+            tracker = get_tracker()
+            buffer = b""
+            first_event_sent = False
+            async for chunk in upstream_resp.aiter_bytes():
+                buffer += chunk
+                while b"\n\n" in buffer:
+                    raw, buffer = buffer.split(b"\n\n", 1)
+                    try:
+                        line = raw.decode("utf-8", errors="replace")
+                    except Exception:
+                        continue
+                    if line.startswith("data: ") and line[6:].strip() != "[DONE]":
+                        try:
+                            chat_data = json.loads(line[6:])
+                        except json.JSONDecodeError:
+                            continue
+                        choices = chat_data.get("choices", [])
+                        if choices:
+                            delta = choices[0].get("delta", {})
+                            text = delta.get("content", "")
+                            if text:
+                                tracker.append_text(text)
+                            usage = chat_data.get("usage")
+                            if usage:
+                                tracker.set_input_tokens(
+                                    usage.get("prompt_tokens", 0))
+                                tracker.set_output_tokens(
+                                    usage.get("completion_tokens", 0))
+                        translated = chat_sse_to_responses_sse(
+                            line, resp_id, model)
+                        if translated:
+                            if not first_event_sent:
+                                created = _make_response_created_sse(
+                                    resp_id, model)
+                                yield (created + "\n").encode()
+                                first_event_sent = True
+                            yield (translated + "\n").encode()
+
+            yield _make_completed_sse(resp_id, model).encode()
+            tracker.end_request()
+
+        return StreamingResponse(
+            translated_stream(),
+            status_code=upstream_resp.status_code,
+            headers=resp_headers,
+            media_type="text/event-stream",
+        )
+
+    # Non-streaming
+    try:
+        chat_data = upstream_resp.json()
+    except json.JSONDecodeError:
+        return JSONResponse(
+            {"error": {"message": upstream_resp.text[:1000]}},
+            status_code=upstream_resp.status_code,
+        )
+
+    resp_data = chat_response_to_responses(chat_data, resp_id, model)
+    return JSONResponse(content=resp_data, status_code=upstream_resp.status_code)
+
+
+def _make_response_created_sse(resp_id: str, model: str) -> str:
+    ev = {
+        "id": resp_id,
+        "object": "response",
+        "model": model,
+        "output": [],
+    }
+    return f"event: response.created\ndata: {json.dumps(ev, ensure_ascii=False)}"
+
+
+def _make_completed_sse(resp_id: str, model: str) -> str:
+    ev = {
+        "id": resp_id,
+        "object": "response",
+        "model": model,
+        "status": "completed",
+    }
+    return f"event: response.completed\ndata: {json.dumps(ev, ensure_ascii=False)}"
