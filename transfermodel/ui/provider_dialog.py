@@ -143,7 +143,7 @@ class ProviderDialog(QDialog):
             msgs_url = f"{base}/v1/messages"
             test_body = {"model": test_model, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
         else:
-            msgs_url = f"{base}/chat/completions"
+            msgs_url = f"{base}/v1/chat/completions"
             test_body = {"model": test_model, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
 
         lines = [

@@ -283,7 +283,7 @@ async def forward_responses(
 
     chat_body = responses_to_chat_request(body)
     chat_body_bytes = json.dumps(chat_body).encode()
-    chat_url = f"{base_url.rstrip('/')}/chat/completions"
+    chat_url = f"{base_url.rstrip('/')}/v1/chat/completions"
     outgoing_headers = rewrite_headers(
         request_headers, base_url, api_key, "openai"
     )
