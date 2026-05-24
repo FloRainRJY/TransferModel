@@ -118,7 +118,7 @@ name = "TransferModel"
 base_url = "http://127.0.0.1:8080/v1"
 wire_api = "responses"
 requires_openai_auth = false
-env_key = "OPENAI_API_KEY"
+api_key = "OPENAI_API_KEY"
 ```
 
 ```bash
@@ -296,7 +296,7 @@ name = "TransferModel"
 base_url = "http://127.0.0.1:8080/v1"
 wire_api = "responses"
 requires_openai_auth = false
-env_key = "OPENAI_API_KEY"
+api_key = "OPENAI_API_KEY"
 ```
 
 ```bash
